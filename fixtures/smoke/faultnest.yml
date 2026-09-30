@@ -1,0 +1,20 @@
+version: 1
+application:
+  name: smoke-app
+capture:
+  repository: false
+  logs:
+    - path: ./app.log
+      tail_lines: 10
+environment:
+  allow_names: [NODE_ENV]
+redaction:
+  emails: true
+  ip_addresses: true
+  paths: true
+replay:
+  command:
+    name: reproduce
+    executable: powershell
+    args: ["-NoProfile", "-Command", "exit 1"]
+  network: OFF

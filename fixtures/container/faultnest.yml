@@ -1,0 +1,22 @@
+version: 1
+application:
+  name: container-smoke
+capture:
+  repository: false
+environment:
+  allow_names: []
+redaction:
+  emails: true
+  ip_addresses: true
+  paths: true
+replay:
+  command:
+    name: reproduce
+    executable: sh
+    args: ["-c", "exit 1"]
+  network: OFF
+  container:
+    image: alpine:3.21
+    cpus: "1"
+    memory: 256m
+    pids_limit: 64
