@@ -1,0 +1,20 @@
+[package]
+name = "faultnest-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+walkdir = "2.5"
+zip = { version = "2.2", default-features = false, features = ["deflate", "zstd"] }
+
+[dev-dependencies]
+tempfile = "3.14"
