@@ -118,18 +118,16 @@ fn run() -> core::Result<()> {
         }
         Cmd::Minimize { bundle, output } => {
             core::verify(&bundle)?;
-            std::fs::copy(bundle, output).map_err(|e| core::Error::Bundle(e.to_string()))?;
-            println!(
-                "Derived bundle created; minimization requires an observed reproduction oracle."
-            );
-            Ok(())
+            Err(core::Error::Replay(format!(
+                "minimize is unavailable: no reproduction oracle is implemented (would have written {})",
+                output.display()
+            )))
         }
         Cmd::Test { bundle } => {
             core::verify(&bundle)?;
-            println!(
-                "A regression scaffold can only be generated after a proven replay. Bundle is valid."
-            );
-            Ok(())
+            Err(core::Error::Replay(
+                "test generation is unavailable: a proven replay assertion is required".into(),
+            ))
         }
         Cmd::Doctor => {
             for x in ["git", "docker"] {
@@ -175,14 +173,15 @@ fn replay(bundle: PathBuf, yes: bool) -> core::Result<()> {
     core::extract(&bundle, &work)?;
     let source = core::reconstruct_source(&m, &work)?;
     let failed = if let Some(policy) = &m.replay.container {
-        core::container_replay(policy, &m.replay.network, &source, &m.replay.command)?
+        core::container_replay(
+            policy,
+            &m.replay.network,
+            &source,
+            &m.replay.command,
+            m.replay.timeout_seconds,
+        )?
     } else {
-        let status = std::process::Command::new(&m.replay.command.executable)
-            .args(&m.replay.command.args)
-            .current_dir(&source)
-            .status()
-            .map_err(|e| core::Error::Replay(format!("trigger could not start: {e}")))?;
-        !status.success()
+        core::run_trigger(&m.replay.command, &source, m.replay.timeout_seconds)?
     };
     println!(
         "{}\nWorkspace: {}",

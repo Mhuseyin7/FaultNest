@@ -7,7 +7,9 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -647,6 +649,7 @@ pub fn container_replay(
     network: &Network,
     workspace: &Path,
     trigger: &CommandSpec,
+    timeout_seconds: u64,
 ) -> Result<bool> {
     if policy.image.trim().is_empty() {
         return Err(Error::Replay("container image is empty".into()));
@@ -686,10 +689,36 @@ pub fn container_replay(
     c.arg(&policy.image)
         .arg(&trigger.executable)
         .args(&trigger.args);
-    let status = c
-        .status()
+    let child = c
+        .spawn()
         .map_err(|e| Error::Replay(format!("Docker trigger could not start: {e}")))?;
-    Ok(!status.success())
+    Ok(!wait_with_timeout(child, timeout_seconds)?)
+}
+
+/// Runs a process without a shell and terminates it once its configured deadline expires.
+/// `true` is a failing trigger; timeout is surfaced separately so it cannot be reported as reproduction.
+pub fn run_trigger(command: &CommandSpec, cwd: &Path, timeout_seconds: u64) -> Result<bool> {
+    let child = Command::new(&command.executable)
+        .args(&command.args)
+        .current_dir(cwd)
+        .spawn()
+        .map_err(|e| Error::Replay(format!("trigger could not start: {e}")))?;
+    Ok(!wait_with_timeout(child, timeout_seconds)?)
+}
+
+fn wait_with_timeout(mut child: Child, timeout_seconds: u64) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| Error::Replay(e.to_string()))? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Replay("trigger timed out".into()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -705,5 +734,67 @@ mod tests {
     #[test]
     fn traversal_is_rejected() {
         assert!(safe_name("../bad").is_err());
+    }
+    #[test]
+    fn capture_never_persists_known_secret() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("app.log"),
+            "Bearer abcdefghijklmnopqrst a@b.com 10.0.0.1",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("request.json"),
+            "Authorization: Bearer abcdefghijklmnopqrst",
+        )
+        .unwrap();
+        let config = Config {
+            version: 1,
+            application: Application {
+                name: "test".into(),
+                version: None,
+            },
+            capture: Capture {
+                logs: vec![LogSpec {
+                    path: "app.log".into(),
+                    tail_lines: 10,
+                    tail_bytes: None,
+                }],
+                ..Default::default()
+            },
+            environment: Environment::default(),
+            redaction: Redaction::default(),
+            replay: Replay {
+                command: CommandSpec {
+                    name: "test".into(),
+                    executable: "echo".into(),
+                    args: vec![],
+                },
+                network: Network::Off,
+                timeout_seconds: 1,
+                container: None,
+            },
+        };
+        let bundle = d.path().join("test.faultnest");
+        capture(
+            d.path(),
+            &config,
+            &bundle,
+            Some(&d.path().join("request.json")),
+        )
+        .unwrap();
+        let out = d.path().join("out");
+        extract(&bundle, &out).unwrap();
+        let mut combined = String::new();
+        for e in walkdir::WalkDir::new(&out)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+        {
+            combined.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+        }
+        assert!(!combined.contains("abcdefghijklmnopqrst"));
+        assert!(!combined.contains("a@b.com"));
+        assert!(!combined.contains("10.0.0.1"));
     }
 }

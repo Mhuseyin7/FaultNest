@@ -41,6 +41,8 @@ FaultNest şunlar değildir:
 - Optional constrained Docker replay: read-only workspace, dropped capabilities, `no-new-privileges`, CPU/RAM/PID limits ve restricted network
 - Local-only Node.js ve Python capture SDK'ları
 
+`minimize` ve `test` komutları, gerçek bir reproduction oracle / assertion engine olmadan success döndürmez. Bu özellikler hazır olmadığında tool güvenli biçimde error verir; fabricated derived bundle veya regression test üretmez.
+
 ## Quick Start
 
 Rust stable kurulu olmalıdır.
