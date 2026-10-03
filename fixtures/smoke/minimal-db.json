@@ -1,0 +1,8 @@
+{
+  "users": [
+    { "id": 1, "email": "alice@example.com" }
+  ],
+  "payments": [
+    { "id": 42, "user_id": 1, "status": "failed" }
+  ]
+}

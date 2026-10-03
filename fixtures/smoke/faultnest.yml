@@ -6,6 +6,10 @@ capture:
   logs:
     - path: ./app.log
       tail_lines: 10
+  database_fixture:
+    path: ./minimal-db.json
+    allowed_tables: [users, payments]
+    max_rows_per_table: 10
 environment:
   allow_names: [NODE_ENV]
 redaction:

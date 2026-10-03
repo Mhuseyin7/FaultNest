@@ -62,9 +62,15 @@ application:
   name: shop-api
 capture:
   repository: true
+  docker:
+    enabled: true
   logs:
     - path: ./logs/app.log
       tail_lines: 5000
+  database_fixture:
+    path: ./fixtures/minimal-db.json
+    allowed_tables: [users, payments]
+    max_rows_per_table: 100
 environment:
   allow_names: [NODE_ENV, APP_ENV]
 redaction:
@@ -107,6 +113,10 @@ replay:
 ```
 
 FaultNest Docker socket mount etmez, privileged mode kullanmaz ve host workspace'i read-only mount eder.
+
+## Database Fixture Capture
+
+FaultNest bir production database'e bağlanmaz veya database dump almaz. Database replay için yalnızca developer tarafından hazırlanmış, reviewed JSON fixture kabul eder. Her table explicit `allowed_tables` listesinde olmalı ve `max_rows_per_table` sınırını aşmamalıdır. Fixture, bundle'a yazılmadan önce diğer capture data gibi sanitize edilir.
 
 ## SDK'lar
 

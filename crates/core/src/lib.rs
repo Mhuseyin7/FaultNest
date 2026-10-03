@@ -62,6 +62,8 @@ pub struct Capture {
     pub commands: Vec<CommandSpec>,
     #[serde(default)]
     pub docker: DockerCapture,
+    #[serde(default)]
+    pub database_fixture: Option<DatabaseFixtureCapture>,
 }
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +90,18 @@ pub struct CommandSpec {
 pub struct DockerCapture {
     #[serde(default)]
     pub enabled: bool,
+}
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseFixtureCapture {
+    /// A reviewed, already-minimized JSON fixture; FaultNest never connects to or dumps a database here.
+    pub path: String,
+    pub allowed_tables: Vec<String>,
+    #[serde(default = "default_max_rows")]
+    pub max_rows_per_table: usize,
+}
+fn default_max_rows() -> usize {
+    1000
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +352,62 @@ fn runtime_versions(root: &Path, specs: &[CommandSpec]) -> BTreeMap<String, Stri
     }
     m
 }
+fn docker_metadata() -> serde_json::Value {
+    let version = run(
+        &["docker", "version", "--format", "{{.Server.Version}}"],
+        Path::new("."),
+    );
+    let containers = run(&["docker", "ps", "--format", "{{json .}}"], Path::new("."))
+        .map(|lines| {
+            lines
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({"version": version, "containers": containers})
+}
+fn capture_database_fixture(
+    spec: &DatabaseFixtureCapture,
+    root: &Path,
+    sanitizer: &mut Sanitizer,
+) -> Result<Vec<u8>> {
+    if spec.allowed_tables.is_empty() {
+        return Err(Error::Config(
+            "database_fixture.allowed_tables cannot be empty".into(),
+        ));
+    }
+    if spec.max_rows_per_table == 0 {
+        return Err(Error::Config(
+            "database_fixture.max_rows_per_table must be positive".into(),
+        ));
+    }
+    let raw =
+        fs::read_to_string(root.join(&spec.path)).map_err(|e| Error::Bundle(e.to_string()))?;
+    let fixture: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| Error::Config(format!("database fixture must be JSON: {e}")))?;
+    let tables = fixture
+        .as_object()
+        .ok_or_else(|| Error::Config("database fixture must be an object keyed by table".into()))?;
+    for (table, rows) in tables {
+        if !spec.allowed_tables.iter().any(|allowed| allowed == table) {
+            return Err(Error::Config(format!(
+                "database table is not allowlisted: {table}"
+            )));
+        }
+        let rows = rows.as_array().ok_or_else(|| {
+            Error::Config(format!("database table {table} must contain an array"))
+        })?;
+        if rows.len() > spec.max_rows_per_table {
+            return Err(Error::Config(format!(
+                "database table {table} exceeds max_rows_per_table"
+            )));
+        }
+    }
+    Ok(sanitizer
+        .sanitize(&serde_json::to_string(&fixture).unwrap())
+        .into_bytes())
+}
 fn tail(path: &Path, spec: &LogSpec) -> std::io::Result<String> {
     let bytes = fs::read(path)?;
     let v = if let Some(n) = spec.tail_bytes {
@@ -424,6 +494,20 @@ pub fn capture(
             "requests/failure.json".into(),
             sz.sanitize(&fs::read_to_string(p).map_err(|e| Error::Bundle(e.to_string()))?)
                 .into_bytes(),
+        );
+    }
+    if cfg.capture.docker.enabled {
+        let metadata = docker_metadata();
+        files.insert(
+            "docker/metadata.json".into(),
+            sz.sanitize(&serde_json::to_string(&metadata).unwrap())
+                .into_bytes(),
+        );
+    }
+    if let Some(spec) = &cfg.capture.database_fixture {
+        files.insert(
+            "database/fixture.json".into(),
+            capture_database_fixture(spec, root, &mut sz)?,
         );
     }
     let git = if cfg.capture.repository {
@@ -796,5 +880,31 @@ mod tests {
         assert!(!combined.contains("abcdefghijklmnopqrst"));
         assert!(!combined.contains("a@b.com"));
         assert!(!combined.contains("10.0.0.1"));
+    }
+    #[test]
+    fn database_fixture_requires_allowlisted_bounded_tables() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("fixture.json"),
+            r#"{"users":[{"email":"a@b.com"}],"payments":[{}]}"#,
+        )
+        .unwrap();
+        let mut sanitizer = Sanitizer::new(Default::default());
+        let rejected = DatabaseFixtureCapture {
+            path: "fixture.json".into(),
+            allowed_tables: vec!["users".into()],
+            max_rows_per_table: 1,
+        };
+        assert!(capture_database_fixture(&rejected, d.path(), &mut sanitizer).is_err());
+        let accepted = DatabaseFixtureCapture {
+            path: "fixture.json".into(),
+            allowed_tables: vec!["users".into(), "payments".into()],
+            max_rows_per_table: 1,
+        };
+        let output = String::from_utf8(
+            capture_database_fixture(&accepted, d.path(), &mut sanitizer).unwrap(),
+        )
+        .unwrap();
+        assert!(!output.contains("a@b.com"));
     }
 }
