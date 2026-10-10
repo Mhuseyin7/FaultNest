@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
 use faultnest_core as core;
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::PathBuf,
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
 #[derive(Parser)]
 #[command(name = "faultnest", version, about = "Capture. Isolate. Replay.")]
 struct Cli {
@@ -44,6 +48,10 @@ enum Cmd {
 fn cfg() -> core::Result<core::Config> {
     core::load_config(&PathBuf::from("faultnest.yml"))
 }
+fn cwd() -> core::Result<PathBuf> {
+    std::env::current_dir()
+        .map_err(|e| core::Error::Config(format!("cannot determine workspace: {e}")))
+}
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -68,12 +76,7 @@ fn run() -> core::Result<()> {
             let c = cfg()?;
             let out = output
                 .unwrap_or_else(|| PathBuf::from(format!("issue-{}.faultnest", chrono_date())));
-            let m = core::capture(
-                &std::env::current_dir().unwrap(),
-                &c,
-                &out,
-                request.as_deref(),
-            )?;
+            let m = core::capture(&cwd()?, &c, &out, request.as_deref())?;
             println!(
                 "Captured {} ({} entries, {} redactions)",
                 out.display(),
@@ -87,7 +90,7 @@ fn run() -> core::Result<()> {
             println!(
                 "FaultNest Preview\nGit metadata            {}\nLockfiles/manifests     {}\nConfigured log files    {}\nEnvironment values      0 (names only)\nNetwork policy           {:?}",
                 c.capture.repository,
-                core::dependency_files(&std::env::current_dir().unwrap()).len(),
+                core::dependency_files(&cwd()?).len(),
                 c.capture.logs.len(),
                 c.replay.network
             );
@@ -108,9 +111,24 @@ fn run() -> core::Result<()> {
         }
         Cmd::Replay { bundle, yes } => replay(bundle, yes),
         Cmd::Down { target } => {
-            if target.exists() {
+            if target.join(".faultnest-workspace").is_file()
+                && target
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.parent().map(PathBuf::from))
+                    == Some(
+                        std::env::temp_dir()
+                            .canonicalize()
+                            .unwrap_or_else(|_| std::env::temp_dir()),
+                    )
+            {
                 std::fs::remove_dir_all(&target).map_err(|e| core::Error::Replay(e.to_string()))?;
                 println!("Removed replay workspace {}", target.display());
+            } else if target.exists() {
+                return Err(core::Error::Replay(
+                    "refusing to remove a directory that is not a FaultNest replay workspace"
+                        .into(),
+                ));
             } else {
                 println!("No local replay workspace found.")
             }
@@ -168,8 +186,17 @@ fn replay(bundle: PathBuf, yes: bool) -> core::Result<()> {
             "confirmation required; rerun with --yes for noninteractive replay".into(),
         ));
     }
-    let work = std::env::temp_dir().join(format!("faultnest-{}", std::process::id()));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let work = std::env::temp_dir().join(format!("faultnest-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&work).map_err(|e| core::Error::Replay(e.to_string()))?;
+    std::fs::write(
+        work.join(".faultnest-workspace"),
+        b"FaultNest replay workspace\n",
+    )
+    .map_err(|e| core::Error::Replay(e.to_string()))?;
     core::extract(&bundle, &work)?;
     let source = core::reconstruct_source(&m, &work)?;
     let failed = if let Some(policy) = &m.replay.container {
