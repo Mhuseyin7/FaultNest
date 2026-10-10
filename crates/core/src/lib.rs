@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command},
     thread,
@@ -185,6 +185,30 @@ pub fn load_config(path: &Path) -> Result<Config> {
     if c.application.name.trim().is_empty() {
         return Err(Error::Config("application.name cannot be empty".into()));
     };
+    if c.replay.command.executable.trim().is_empty() {
+        return Err(Error::Config(
+            "replay.command.executable cannot be empty".into(),
+        ));
+    }
+    if c.replay.timeout_seconds == 0 {
+        return Err(Error::Config(
+            "replay.timeout_seconds must be positive".into(),
+        ));
+    }
+    if let Some(container) = &c.replay.container
+        && (container.image.trim().is_empty() || container.pids_limit == 0)
+    {
+        return Err(Error::Config(
+            "replay.container requires a non-empty image and positive pids_limit".into(),
+        ));
+    }
+    for log in &c.capture.logs {
+        if log.path.trim().is_empty() || (log.tail_lines == 0 && log.tail_bytes.unwrap_or(0) == 0) {
+            return Err(Error::Config(
+                "capture.logs entries require path and a positive tail limit".into(),
+            ));
+        }
+    }
     Ok(c)
 }
 
@@ -244,7 +268,7 @@ impl Sanitizer {
         let patterns = [
             (
                 "PRIVATE_KEY",
-                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
             ),
             (
                 "JWT",
@@ -382,8 +406,8 @@ fn capture_database_fixture(
             "database_fixture.max_rows_per_table must be positive".into(),
         ));
     }
-    let raw =
-        fs::read_to_string(root.join(&spec.path)).map_err(|e| Error::Bundle(e.to_string()))?;
+    let raw = fs::read_to_string(safe_capture_path(root, &spec.path)?)
+        .map_err(|e| Error::Bundle(e.to_string()))?;
     let fixture: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| Error::Config(format!("database fixture must be JSON: {e}")))?;
     let tables = fixture
@@ -409,22 +433,23 @@ fn capture_database_fixture(
         .into_bytes())
 }
 fn tail(path: &Path, spec: &LogSpec) -> std::io::Result<String> {
-    let bytes = fs::read(path)?;
-    let v = if let Some(n) = spec.tail_bytes {
-        bytes[bytes.len().saturating_sub(n)..].to_vec()
-    } else {
-        let s = String::from_utf8_lossy(&bytes);
-        s.lines()
-            .rev()
-            .take(spec.tail_lines)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into_bytes()
-    };
-    Ok(String::from_utf8_lossy(&v).to_string())
+    let mut file = fs::File::open(path)?;
+    if let Some(n) = spec.tail_bytes {
+        let size = file.metadata()?.len();
+        file.seek(SeekFrom::Start(size.saturating_sub(n as u64)))?;
+        let mut bytes = Vec::with_capacity(n.min(8 * 1024 * 1024));
+        file.take(n as u64).read_to_end(&mut bytes)?;
+        return Ok(String::from_utf8_lossy(&bytes).to_string());
+    }
+    let mut lines = std::collections::VecDeque::with_capacity(spec.tail_lines.min(100_000));
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if lines.len() == spec.tail_lines {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
 }
 pub fn dependency_files(root: &Path) -> Vec<PathBuf> {
     [
@@ -462,6 +487,31 @@ fn safe_name(p: &str) -> Result<()> {
         Ok(())
     }
 }
+fn safe_capture_path(root: &Path, configured: &str) -> Result<PathBuf> {
+    let relative = Path::new(configured);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(Error::Config(format!(
+            "capture path must stay inside workspace: {configured}"
+        )));
+    }
+    let root = fs::canonicalize(root)
+        .or_else(|_| std::path::absolute(root))
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let path = root.join(relative);
+    let canonical = fs::canonicalize(&path)
+        .or_else(|_| std::path::absolute(&path))
+        .map_err(|e| Error::Bundle(e.to_string()))?;
+    if !canonical.starts_with(&root) {
+        return Err(Error::Unsafe(format!(
+            "capture path escapes workspace: {configured}"
+        )));
+    }
+    Ok(canonical)
+}
 pub fn capture(
     root: &Path,
     cfg: &Config,
@@ -479,7 +529,7 @@ pub fn capture(
         );
     }
     for spec in &cfg.capture.logs {
-        let p = root.join(&spec.path);
+        let p = safe_capture_path(root, &spec.path)?;
         if p.is_file() {
             let name = format!("logs/{}", p.file_name().unwrap().to_string_lossy());
             files.insert(
@@ -598,6 +648,7 @@ pub fn verify(bundle: &Path) -> Result<Manifest> {
         return Err(Error::Unsafe("too many entries".into()));
     }
     let mut all = BTreeMap::new();
+    let mut total_size = 0u64;
     for i in 0..z.len() {
         let mut e = z.by_index(i).map_err(|e| Error::Bundle(e.to_string()))?;
         safe_name(e.name())?;
@@ -606,6 +657,12 @@ pub fn verify(bundle: &Path) -> Result<Manifest> {
         }
         if e.size() > 100 * 1024 * 1024 {
             return Err(Error::Unsafe(format!("entry too large: {}", e.name())));
+        }
+        total_size = total_size.saturating_add(e.size());
+        if total_size > 512 * 1024 * 1024 {
+            return Err(Error::Unsafe(
+                "bundle uncompressed size exceeds 512 MiB".into(),
+            ));
         }
         let mut b = Vec::new();
         e.read_to_end(&mut b)
@@ -810,10 +867,11 @@ mod tests {
     #[test]
     fn secret_never_survives() {
         let mut s = Sanitizer::new(Default::default());
-        let o=s.sanitize("Authorization: Bearer abcdefghijklmnopqrst\na@b.com 10.1.2.3 ghp_123456789012345678901234567890");
+        let o=s.sanitize("Authorization: Bearer abcdefghijklmnopqrst\na@b.com 10.1.2.3 ghp_123456789012345678901234567890\n-----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----");
         assert!(!o.contains("abcdefghijkl"));
         assert!(!o.contains("a@b.com"));
         assert!(!o.contains("10.1.2.3"));
+        assert!(!o.contains("PRIVATE KEY-----secret"));
     }
     #[test]
     fn traversal_is_rejected() {
